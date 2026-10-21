@@ -15,7 +15,7 @@ fi
 
 docker_version="$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
 if [ "${docker_version%%.*}" -lt 28 ] 2>/dev/null; then
-  echo "Warning: Docker $docker_version; OpenShell 0.1.2 needs 28+ (sandbox creation fails on 27.x, see README)." >&2
+  echo "Warning: Docker $docker_version; OpenShell 0.1.2 needs 28+ (sandbox creation fails on 27.x)." >&2
 fi
 
 mkdir -p "$state" "$(dirname "$config")"

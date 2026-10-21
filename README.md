@@ -178,16 +178,6 @@ Check with `openshell status` (`Connected`, `Authenticated (mTLS transport)`). `
 
 ## macOS / colima notes
 
-- **Docker 28+ required in the colima VM.** OpenShell 0.1.2 is qualified against Docker 28.0.4. With colima 0.8.1 (Docker 27.4.0) `just openshell` fails with `BoundaryConfigWriteFailed: stage Docker sandbox bundle: ... getent unable to find entry "998:998" in passwd database`. Check with `docker version --format '{{.Server.Version}}'`. Fixed by upgrading Docker in the VM to 28.5.2 (verified); this restarts the containers in that profile. Colima holds the packages, so unhold first:
-
-  ```bash
-  colima ssh -- sudo apt-mark unhold docker-ce docker-ce-cli containerd.io
-  colima ssh -- sudo apt-get update
-  colima ssh -- sudo apt-get install -y --allow-downgrades docker-ce=5:28.5.2-1~ubuntu.24.04~noble docker-ce-cli=5:28.5.2-1~ubuntu.24.04~noble containerd.io
-  colima ssh -- sudo apt-mark hold docker-ce docker-ce-cli containerd.io
-  ```
-
-  The alternative is a newer colima and a recreated VM, which drops that profile's images and containers.
 - Falco has to run inside the colima VM, with a kernel that has BTF. `just falco` points `DOCKER_HOST` at colima, and `falco/run.sh` mounts the rules from `$HOME`, which colima shares with the VM.
 
 ## License
