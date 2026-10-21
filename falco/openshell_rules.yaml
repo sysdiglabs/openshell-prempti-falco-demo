@@ -1,0 +1,226 @@
+# Falco rules for NVIDIA OpenShell agent sandboxes (validated with Falco 0.45).
+#
+# These rules cover what the sandbox policy allows, plus attempts it denies: OpenShell's
+# denials (Landlock, the network policy) fail the syscall with EACCES/EPERM, so Falco
+# still sees the attempt.
+
+- macro: openshell_sandbox
+  condition: container.label[openshell.ai/isolation-role] = sandbox
+
+- macro: openshell_runtime
+  condition: proc.exepath startswith /.openshell/
+
+# Prempti (installed root-owned under /opt/prempti) registers its own Claude Code hook.
+- macro: prempti_proc
+  condition: proc.exepath startswith /opt/prempti/
+
+# OpenShell injects its runtime into the sandbox container; the stock drift rule flags it.
+- rule: Drop and execute new binary in container
+  exceptions:
+    - name: openshell_runtime
+      fields: [proc.exepath]
+      comps: [startswith]
+      values: [[/.openshell/]]
+  override:
+    exceptions: append
+
+# Tools reading their own credentials (git clone over ssh, gh, git over https) are expected.
+- macro: credential_owner_tool
+  condition: >
+    (proc.name in (ssh, scp, sftp, ssh-add) and fs.path.name contains /.ssh/)
+    or (proc.name = gh and fs.path.name contains /.config/gh/)
+    or (proc.name in (git-remote-http, git-remote-https, git-credential-store)
+        and (fs.path.name endswith /.netrc or fs.path.name endswith /.git-credentials))
+
+# Failed opens count too: probing for credentials is a signal even if the file is missing.
+- rule: OpenShell Agent Credential Access
+  desc: Agent inside an OpenShell sandbox opens (or tries to open) a credential file.
+  condition: >
+    evt.type in (open, openat, openat2) and evt.is_open_read = true
+    and openshell_sandbox and not openshell_runtime and not credential_owner_tool
+    and not (fs.path.name endswith /.claude/.credentials.json and proc.exepath = /usr/local/bin/claude)
+    and (fs.path.name contains /.ssh/ or fs.path.name contains /.aws/ or fs.path.name contains /.config/gh/
+         or fs.path.name contains /.kube/ or fs.path.name endswith /.docker/config.json
+         or fs.path.name endswith /.env or fs.path.name endswith /.netrc
+         or fs.path.name endswith /.git-credentials or fs.path.name endswith /.credentials.json)
+  output: >
+    Agent opened credential file (sandbox=%container.label[openshell.ai/sandbox-name]
+    file=%fs.path.name res=%evt.res proc=%proc.name cmd=%proc.cmdline parent=%proc.pname)
+  priority: WARNING
+  tags: [openshell, credential_access]
+
+# `ps` reads every /proc/*/environ, but only prints it with the BSD `e` flag (`ps auxe`).
+# Claude Code runs `ps aux` on its own.
+- rule: OpenShell Agent Reads Other Process Environment
+  desc: Agent reads /proc/<pid>/environ of another process (secret harvesting).
+  condition: >
+    open_read and openshell_sandbox and not openshell_runtime
+    and fd.name glob /proc/*/environ and not fd.name = /proc/self/environ
+    and not (proc.name = ps and not proc.args contains e)
+  output: >
+    Agent read process environment (sandbox=%container.label[openshell.ai/sandbox-name]
+    file=%fd.name proc=%proc.name cmd=%proc.cmdline parent=%proc.pname)
+  priority: WARNING
+  tags: [openshell, credential_access]
+
+# fs.path.name is empty for unlink/unlinkat; their path is only in the syscall args.
+- rule: OpenShell Runtime Tampering
+  desc: Agent tries to modify OpenShell runtime, channel or CA material (failed attempts included).
+  condition: >
+    openshell_sandbox and not openshell_runtime
+    and (((evt.type in (open, openat, openat2) and evt.is_open_write = true)
+          or evt.type in (rename, renameat, renameat2, chmod, fchmodat))
+         and (fs.path.name startswith /.openshell/ or fs.path.name startswith /run/openshell)
+         or (evt.type = unlinkat and (evt.arg.name startswith /.openshell/ or evt.arg.name startswith /run/openshell))
+         or (evt.type = unlink and (evt.arg.path startswith /.openshell/ or evt.arg.path startswith /run/openshell)))
+  output: >
+    OpenShell runtime tampering attempt (sandbox=%container.label[openshell.ai/sandbox-name]
+    evt=%evt.type path=%fs.path.name args=%evt.args res=%evt.res proc=%proc.name cmd=%proc.cmdline)
+  priority: CRITICAL
+  tags: [openshell, defense_evasion]
+
+# OpenShell rejects connections outside the policy with EACCES; the destination is
+# only in the syscall args (no fd tuple is created).
+- rule: OpenShell Blocked Egress Attempt
+  desc: Agent tries to connect somewhere the sandbox policy does not allow (e.g. a direct IP to bypass the proxy).
+  condition: >
+    evt.type = connect and evt.res = EACCES
+    and openshell_sandbox and not openshell_runtime
+  output: >
+    Agent connection blocked by OpenShell (sandbox=%container.label[openshell.ai/sandbox-name]
+    dest=%evt.arg.addr proc=%proc.name exe=%proc.exepath cmd=%proc.cmdline)
+  priority: WARNING
+  tags: [openshell, exfiltration, defense_evasion]
+
+# OpenShell's network policy is per binary. Claude Code's policy also allows `node`, a
+# general-purpose interpreter, so any script run with it inherits the same egress.
+# Allowed egress goes through OpenShell's DNS + transparent proxy: the agent connects to a
+# synthetic address in 198.18.0.0/15, which identifies real outbound traffic.
+- list: openshell_interpreters
+  items: [node, python, python3, python3.14, ruby, perl, deno, bun]
+
+- rule: OpenShell Interpreter Egress Allowed By Policy
+  desc: A script interpreter in the sandbox reaches the internet through a policy that allows it (OpenShell lets it through).
+  condition: >
+    evt.type = connect and evt.res = SUCCESS and evt.arg.addr startswith 198.18.
+    and openshell_sandbox and not openshell_runtime
+    and proc.name in (openshell_interpreters)
+  output: >
+    Interpreter egress allowed by OpenShell policy (sandbox=%container.label[openshell.ai/sandbox-name]
+    proxied_addr=%evt.arg.addr proc=%proc.name cmd=%proc.cmdline parent=%proc.pname)
+  priority: NOTICE
+  tags: [openshell, exfiltration]
+
+# Prempti's daemon stops its own Falco child on shutdown.
+- rule: OpenShell Agent Signals Process
+  desc: Agent sends a terminating signal or ptraces a process (e.g. the OpenShell runtime, pid 1).
+  condition: >
+    openshell_sandbox and not openshell_runtime and not prempti_proc
+    and ((evt.type in (kill, tkill, tgkill) and evt.arg.sig in (SIGKILL, SIGTERM, SIGSTOP)) or evt.type = ptrace)
+  output: >
+    Agent signalled/ptraced a process (sandbox=%container.label[openshell.ai/sandbox-name]
+    evt=%evt.type args=%evt.args proc=%proc.name cmd=%proc.cmdline)
+  priority: WARNING
+  tags: [openshell, defense_evasion]
+
+- list: openshell_network_tools
+  items: [nc, ncat, netcat, socat, nmap, telnet, tcpdump]
+
+- rule: OpenShell Agent Runs Network Tool
+  desc: Network recon / reverse shell tooling launched inside an agent sandbox.
+  condition: spawned_process and openshell_sandbox and proc.name in (openshell_network_tools)
+  output: >
+    Network tool in agent sandbox (sandbox=%container.label[openshell.ai/sandbox-name]
+    proc=%proc.name cmd=%proc.cmdline parent=%proc.pname)
+  priority: NOTICE
+  tags: [openshell, discovery]
+
+- macro: openshell_persistence_path
+  condition: >
+    (fs.path.name endswith /.bashrc or fs.path.name endswith /.zshrc or fs.path.name endswith /.profile
+     or fs.path.name endswith /.bash_profile or fs.path.name contains /.git/hooks/
+     or fs.path.name endswith /.claude/settings.json or fs.path.name endswith /.mcp.json)
+
+- macro: openshell_persistence_target
+  condition: >
+    (fs.path.target endswith /.bashrc or fs.path.target endswith /.zshrc or fs.path.target endswith /.profile
+     or fs.path.target endswith /.bash_profile or fs.path.target contains /.git/hooks/
+     or fs.path.target endswith /.claude/settings.json or fs.path.target endswith /.mcp.json)
+
+# Expected writes: git's *.sample hook templates (never run), and Claude Code updating its
+# own settings.json (Prempti denies the agent's Write/Edit tools on that file).
+- macro: openshell_persistence_expected
+  condition: >
+    fs.path.name endswith .sample
+    or (proc.exepath = /usr/local/bin/claude
+        and (fs.path.name endswith /.claude/settings.json or fs.path.target endswith /.claude/settings.json))
+
+# Editors (incl. Claude Code's Edit/Write tools) write a temp file and rename it over
+# the target, so both direct writes and renames are covered.
+- rule: OpenShell Agent Persistence Write
+  desc: Agent writes shell rc files, git hooks or agent hook/MCP configs.
+  condition: >
+    openshell_sandbox and not openshell_runtime and not prempti_proc and not openshell_persistence_expected
+    and ((evt.type in (open, openat, openat2) and evt.is_open_write = true and openshell_persistence_path)
+         or (evt.type in (rename, renameat, renameat2) and openshell_persistence_target))
+  output: >
+    Agent wrote persistence vector (sandbox=%container.label[openshell.ai/sandbox-name]
+    evt=%evt.type file=%fs.path.name target=%fs.path.target proc=%proc.name cmd=%proc.cmdline)
+  priority: NOTICE
+  tags: [openshell, persistence]
+
+# Watching the watchman. Prempti runs as the agent's uid, so the agent can stop it
+# (SIGTERM makes the daemon remove its own hook) or put another broker in its place.
+- macro: prempti_daemon
+  condition: prempti_proc and proc.name = premptictl and proc.args startswith daemon
+
+# procexit fires once per thread; match the main thread only (tid = pid).
+# Sandbox teardown does not trigger it: the processes go away with the container.
+- rule: OpenShell Prempti Stopped
+  desc: Prempti's daemon exits while the sandbox is still running.
+  condition: evt.type = procexit and openshell_sandbox and prempti_daemon and thread.tid = val(proc.pid)
+  output: >
+    Prempti daemon stopped (sandbox=%container.label[openshell.ai/sandbox-name]
+    pid=%proc.vpid args=%evt.args)
+  priority: CRITICAL
+  tags: [openshell, defense_evasion]
+
+# The sockets live in /tmp/prempti/run, reached through several symlinks, and the
+# unlink path is the raw argument (may be relative): match on the file name.
+- rule: OpenShell Prempti Tampering
+  desc: Agent deletes or moves Prempti's sockets, socket dir or ~/.prempti link (to swap the broker).
+  condition: >
+    openshell_sandbox and not prempti_proc
+    and ((evt.type = unlinkat and (evt.arg.name endswith broker.sock or evt.arg.name endswith supervisor.sock
+                                   or evt.arg.name endswith .prempti))
+         or (evt.type = unlink and (evt.arg.path endswith broker.sock or evt.arg.path endswith supervisor.sock
+                                    or evt.arg.path endswith .prempti))
+         or (evt.type in (rename, renameat, renameat2)
+             and (fs.path.source endswith .prempti or fs.path.target endswith .prempti
+                  or fs.path.source endswith /prempti/run)))
+  output: >
+    Prempti tampering attempt (sandbox=%container.label[openshell.ai/sandbox-name]
+    evt=%evt.type args=%evt.args res=%evt.res proc=%proc.name cmd=%proc.cmdline)
+  priority: CRITICAL
+  tags: [openshell, defense_evasion]
+
+# The real Prempti runs from /opt/prempti (root-owned), started by the entrypoint with
+# HOME=/sandbox. Its config paths use ${HOME}, so another HOME means other rules.
+# proc.name is the 15-char comm: claude-interceptor shows up as claude-intercep.
+- list: prempti_binaries
+  items: [premptictl, falco, claude-intercep]
+
+- rule: OpenShell Rogue Prempti Instance
+  desc: >
+    A Prempti binary runs from outside /opt/prempti, Prempti runs with a HOME other than
+    /sandbox, or a Prempti daemon is started by something other than the entrypoint.
+  condition: >
+    spawned_process and openshell_sandbox
+    and ((proc.name in (prempti_binaries) and not prempti_proc)
+         or (prempti_proc and proc.env[HOME] != /sandbox)
+         or (prempti_daemon and proc.pname != claude-prempti))
+  output: >
+    Rogue Prempti instance (sandbox=%container.label[openshell.ai/sandbox-name]
+    exe=%proc.exepath home=%proc.env[HOME] cmd=%proc.cmdline parent=%proc.pname)
+  priority: CRITICAL
+  tags: [openshell, defense_evasion]

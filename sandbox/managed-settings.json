@@ -1,0 +1,13 @@
+{
+  "allowManagedHooksOnly": true,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "/opt/prempti/bin/claude-interceptor" }
+        ]
+      }
+    ]
+  }
+}

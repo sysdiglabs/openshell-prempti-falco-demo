@@ -1,0 +1,17 @@
+# Prempti user rules for OpenShell sandboxes (installed in /opt/prempti/rules/user/).
+# Same format as Prempti's default rules: WARNING = ask, CRITICAL = deny.
+
+# Prempti denies `pkill premptictl`, but a plain `kill <pid>` passes, and SIGTERM
+# makes the daemon remove its own hook. Ask a human before any signal from the agent.
+- rule: Ask before signalling processes
+  desc: >
+    Requires user confirmation before the agent sends a signal with kill, pkill
+    or killall. Coding tasks rarely need it, and it is how an agent stops Prempti.
+  condition: >
+    is_bash and not is_pure_search_or_print_command
+    and (tool.input_command contains "kill " or tool.input_command contains "killall")
+  output: >
+    Falco requires confirmation before the agent signals a process (%tool.input_command)
+  priority: WARNING
+  source: coding_agent
+  tags: [coding_agent_ask, prempti_self_protection]

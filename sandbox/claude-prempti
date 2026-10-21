@@ -1,0 +1,16 @@
+#!/bin/bash
+# Start Prempti before Claude Code: the managed hook (/etc/claude-code) denies every
+# tool call while the daemon is down. The daemon also registers its own hook in
+# ~/.claude/settings.json; allowManagedHooksOnly makes Claude Code ignore it.
+set -euo pipefail
+P="$HOME/.prempti"
+mkdir -p /tmp/prempti/run /tmp/prempti/log
+"$P/bin/premptictl" daemon </dev/null >/tmp/prempti/log/daemon.out 2>&1 &
+for _ in $(seq 1 100); do "$P/bin/premptictl" health >/dev/null 2>&1 && break; sleep 0.2; done
+"$P/bin/premptictl" health >/dev/null || { cat /tmp/prempti/log/daemon.out >&2; exit 1; }
+# No background traffic outside the policy: telemetry and auto-updates, claude.ai MCP
+# connectors (mcp-proxy.anthropic.com), the official plugin marketplace clone.
+# Set here, not as image ENV: OpenShell does not pass the image's ENV to the sandbox.
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 ENABLE_CLAUDEAI_MCP_SERVERS=false \
+  CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1
+exec claude "$@"
