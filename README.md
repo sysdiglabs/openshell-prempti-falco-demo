@@ -1,6 +1,6 @@
 # OpenShell + Prempti + Falco demo
 
-A demo of three layers of defense for AI coding agents: an [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) sandbox, [Prempti](https://github.com/falcosecurity/prempti) inside it, and [Falco](https://falco.org) on the host. It accompanies the blog post *Who watches the watchmen?*
+A demo of three layers of defense for AI coding agents: an [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) sandbox, [Prempti](https://github.com/falcosecurity/prempti) inside it, and [Falco](https://falco.org) on the host. It accompanies the blog post [Three layers of open-source defense for AI coding agents: OpenShell, Prempti and Falco](https://www.sysdig.com/blog/three-layers-of-open-source-defense-for-ai-coding-agents-openshell-prempti-and-falco).
 
 This is a demo, not a supported product. It was built and tested on macOS (Apple Silicon) with colima, OpenShell 0.1.2, Falco 0.45 and Prempti 0.2.1. Only the arm64 image has been tested.
 
